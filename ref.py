@@ -1,7 +1,9 @@
 import os
 import sys
+import pywt
 import datetime
 import numpy as np
+import scipy.signal
 import scipy.io as scio
 import matplotlib.pyplot as plt
 import torch
@@ -10,6 +12,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader,Dataset
 from torchvision import transforms
 from torchsummary import summary
+
 
 
 # Hyper parameters
@@ -23,6 +26,11 @@ WINDOW_LEN = 200
 OVERLAP_LEN = 50
 LENGTH = 1000
 SEGMENT_NUM = (LENGTH - (WINDOW_LEN - OVERLAP_LEN)) / OVERLAP_LEN  #18
+wavelet = pywt.Wavelet('db5')
+low_filter = torch.Tensor(wavelet.dec_lo[::-1])
+high_filter = torch.Tensor(wavelet.dec_hi[::-1])
+low_filters = low_filter.repeat(128,1).reshape(128,1,10).cuda()
+high_filters = high_filter.repeat(128,1).reshape(128,1,10).cuda()
 
 def select_channel_in_time_domain(aquisition):
     if channels_num == 128:
@@ -109,6 +117,8 @@ class EMGData(Dataset): #继承Dataset
         #self.transform = transform #变换
         #self.images = os.listdir(self.root_dir)#目录里的所有文件
         self.dataset = load_dataset(sub,ges,trail) #shape ---> [gesture_type,number,channel,wave_length]
+        #self.dataset = torch.norm(torch.rfft(self.dataset,1),p=2,dim=4)
+
         print('----- > emg tensor size')
         print(self.dataset.size())
         self.gesture_type = self.dataset.size(0)
@@ -131,8 +141,9 @@ class EMGData(Dataset): #继承Dataset
         num = index % self.number
         #print('{0}:{1}'.format(label,num))
         data = self.dataset[label,num] 
+        feature = torch.sqrt(torch.mean(data*data,1,keepdim=True))
         #sample = {'data111':data,'label222':label}
-        return data,label
+        return data,feature,label
 
 class ChannelAttention(nn.Module):
     def __init__(self, in_planes, ratio=16,init_weights=True):
@@ -144,6 +155,9 @@ class ChannelAttention(nn.Module):
         self.bn1 = nn.BatchNorm1d(in_planes // ratio)
         self.relu1 = nn.ReLU()
         self.softmax = nn.Softmax(dim = -1)
+
+        self.conv1 = nn.Conv2d(4, 256, 3, padding=1, bias=False)
+        self.fc = nn.Linear(128*256,128,bias=False)
         '''
         self.fc1   = nn.Conv1d(16, 8, 1, bias=False)
         self.fc1_   = nn.Conv1d(8, 4, 1, bias=False)
@@ -161,20 +175,47 @@ class ChannelAttention(nn.Module):
     def forward(self, x, layer = 0):
         #print(x.size())
         #print(self.avg_pool(x).size())
-        avg_pool = self.avg_pool(torch.abs(x))
-        #avg_pool = torch.randn(x.size(0),128,1)
-        #avg_pool = torch.mean(torch.abs(x),2).reshape(x.size(0),128,1)
-        max_pool = self.max_pool(torch.abs(x))
-        sqrt_avg_pool = torch.sqrt(torch.sum(x*x,2)).reshape(x.size(0),128,1)
+        #avg_pool = self.avg_pool(torch.abs(x))
+        #avg_pool = torch.mean(torch.abs(x),2).reshape(x.size(0),x.size(1),1)
+        #avg_pool = torch.sum(x*x, dim=1).reshape(x.size(0),x.size(2),1) # weighting in frequency domain, need a transpose
+        #max_pool = self.max_pool(torch.abs(x))
+        #x = torch.sqrt(torch.mean(x*x,2)).reshape(x.size(0),1,16,8)
         
+        '''
         x1 = torch.sign(x[:,:,0:WINDOW_LEN - 1])
         x2 = torch.sign(x[:,:,1:WINDOW_LEN])
         zc = torch.eq(x1,x2)
         zc_sum = WINDOW_LEN - torch.sum(zc,2)
-        zc_sum = zc_sum.reshape(x.size(0),128,1)
+        zc_sum = zc_sum.reshape(x.size(0),1,16,8)
         zc_sum = zc_sum.type(torch.cuda.FloatTensor)
+        #x = torch.cat((rms,zc_sum),dim=1)
+        '''
+        '''
+        subband1_energy = torch.randn(x.size(0),x.size(1),1)
+        subband2_energy = torch.randn(x.size(0),x.size(1),1)
+        subband3_energy = torch.randn(x.size(0),x.size(1),1)
+        subband4_energy = torch.randn(x.size(0),x.size(1),1)
+        for i in range(x.size(0)):
+            for j in range(128):
+                wp = pywt.WaveletPacket(x[i,j].cpu().detach().numpy(), wavelet='sym5',mode='symmetric',maxlevel=2)
+                subband1_energy[i,j,0] = torch.Tensor(np.array(np.linalg.norm(wp['aa'].data,ord=None)))
+                subband2_energy[i,j,0] = torch.Tensor(np.array(np.linalg.norm(wp['ad'].data,ord=None)))
+                subband3_energy[i,j,0] = torch.Tensor(np.array(np.linalg.norm(wp['da'].data,ord=None)))
+                subband4_energy[i,j,0] = torch.Tensor(np.array(np.linalg.norm(wp['dd'].data,ord=None)))
+            #print(i,":",subband1_energy[i].reshape(16,8))
+        '''
+        x_a = F.conv1d(x,low_filters.cuda(),padding = 9,groups = 128)
+        x_aa = F.conv1d(x_a,low_filters.cuda(),padding = 9,groups = 128)
+        x_ad = F.conv1d(x_a,low_filters.cuda(),padding = 9,groups = 128)
+        x_aa_rms = torch.sqrt(torch.mean(x_aa*x_aa,2)).reshape(x.size(0),1,16,8)
+        x_ad_rms = torch.sqrt(torch.mean(x_ad*x_ad,2)).reshape(x.size(0),1,16,8)
 
-        #print(zc_sum[0].reshape(16,8))
+        x_d = F.conv1d(x,high_filters.cuda(),padding = 9,groups = 128)
+        x_da = F.conv1d(x_d,high_filters.cuda(),padding = 9,groups = 128)
+        x_dd = F.conv1d(x_d,high_filters.cuda(),padding = 9,groups = 128)
+        x_da_rms = torch.sqrt(torch.mean(x_da*x_da,2)).reshape(x.size(0),1,16,8)
+        x_dd_rms = torch.sqrt(torch.mean(x_dd*x_dd,2)).reshape(x.size(0),1,16,8)
+        x = torch.cat((x_aa_rms,x_ad_rms,x_da_rms,x_dd_rms),dim=1)
 
         '''
         x_att = x.cpu().detach().numpy()
@@ -189,26 +230,33 @@ class ChannelAttention(nn.Module):
                 zc_sum[i][j][0] = np.where(zc[i][j][k] > 0)[0].shape[0]
         print(zc_sum[0].reshape(16,8))
         '''
-
-        avg_out = self.fc2(self.relu1(self.bn1(self.fc1(avg_pool)))) # mean is not a salient feature
+        #avg_out = self.fc2(self.relu1(self.bn1(self.fc1(x)))) 
+        #avg_out = self.fc2(self.relu1(self.bn1(self.fc1(sqrt_avg_pool)))) 
+        #avg_out2 = self.fc2(self.relu1(self.bn1(self.fc1(subband2_energy)))) 
+        #avg_out3 = self.fc2(self.relu1(self.bn1(self.fc1(subband3_energy)))) 
+        #avg_out4 = self.fc2(self.relu1(self.bn1(self.fc1(subband4_energy)))) 
+        #avg_out = avg_out.transpose(2,1)
         #max_out = self.fc2(self.relu1(self.bn1(self.fc1(max_pool))))
         #sqrt_out = self.fc2(self.relu1(self.bn1(self.fc1(sqrt_avg_pool))))
-        #zc_out = self.fc2(self.relu1(self.bn1(self.fc1(zc_sum))))
+        #out = self.fc2(self.relu1(self.bn1(self.fc1(zc_sum))))
+        #out = self.fc2(self.relu1(self.bn1(self.fc1(zc_sum))))
         
-        '''
-        print("-------------------------")
-        print(avg_pool[-1].reshape(16,8))
-        print(avg_out[-1].reshape(16,8))
-        print(max_pool[-1].reshape(16,8))
-        print(max_out[-1].reshape(16,8))
-        print(sqrt_avg_pool[-1].reshape(16,8))
-        print(sqrt_out[-1].reshape(16,8))
+        #print("-------------------------")
+        #print(avg_pool[-1].reshape(16,8))
+        #print(avg_out[-1].reshape(16,8))
+        #print(self.sigmoid(avg_out[-1].reshape(16,8)))
+        #print(max_pool[-1].reshape(16,8))
+        #print(max_out[-1].reshape(16,8))
+        #print(self.sigmoid(max_out[-1].reshape(16,8)))
+        #print(sqrt_avg_pool[-1].reshape(16,8))
+        #print(sqrt_out[-1].reshape(16,8))
         #print(zc_sum[-1].reshape(16,8))
-        #print(zc_out[-1].reshape(16,8))
-        '''
+        #print(self.sigmoid(zc_out[-1].reshape(16,8)))
 
-        out = avg_out 
-        return self.sigmoid(out)
+        avg_out = self.conv1(x)
+        avg_out = self.fc(avg_out.reshape(x.size(0),-1))
+        #out = avg_out + max_out
+        return self.sigmoid(avg_out).reshape(x.size(0),128,1)
         #return self.softmax(out)
         '''
         if layer == 1:
@@ -312,7 +360,7 @@ class FIXED_TICNN_AT(nn.Module):
         self.group_cnn_128 = nn.Conv1d(channels_num, 128, kernel_size=1, groups = 128) # aggragate spatial channel
         self.group_cnn_256 = nn.Conv1d(256, 256, kernel_size=1, groups = 256) # aggragate spatial channel
         self.group_cnn_512 = nn.Conv1d(512, 512, kernel_size=1, groups = 512) # aggragate spatial channel
-        self.ca_input = ChannelAttention(channels_num)	
+        self.ca_input = ChannelAttention(128)	
         self.ca_64 = ChannelAttention(64)	
         self.ca_128 = ChannelAttention(128)	
         self.ca_256_1 = ChannelAttention(256)	
@@ -334,7 +382,7 @@ class FIXED_TICNN_AT(nn.Module):
 
 
     #def forward(self, x, length):
-    def forward(self, x):
+    def forward(self, x, y):
 
         # Covolutions
         '''
@@ -352,8 +400,34 @@ class FIXED_TICNN_AT(nn.Module):
 
 
         if sys.argv[1] == '1':
-            x = self.ca_input(x,layer=1)*x #N*C*1   *   N*C*L
+            x = self.ca_input(x) * x #N*C*1   *   N*C*L
+            #x = self.ca_input(y.reshape(y.size(0),1,16,8)) * x #N*C*1   *   N*C*L
+            #x = torch.norm(torch.rfft(x,1),p=2,dim=3)
+            #x = self.ca_input(x) * x #N*C*1   *   N*C*L
+            #y = torch.linspace(0,100,101).reshape(101,1)
+            #z = torch.matmul(x*x,y)
+            #z = torch.mean(x*x,2).reshape(x.size(0),x.size(1),1)
+            #x = self.ca_input(z) * x #N*C*1   *   N*C*L
+
+            #sqrt_avg_pool = torch.sqrt(torch.mean(x*x,2)).reshape(x.size(0),x.size(1),1)
+            #x = self.ca_input(y) * x #N*C*1   *   N*C*L
             #x = self.ca_input(x,layer=2)*x #N*C*1   *   N*C*L
+            
+            '''
+            x_a = F.conv1d(x,low_filters.cuda(),padding = 9,groups = 128)
+            x_aa = F.conv1d(x_a,low_filters.cuda(),padding = 9,groups = 128)
+            x_ad = F.conv1d(x_a,low_filters.cuda(),padding = 9,groups = 128)
+            x_aa = self.ca_input(x_aa) * x_aa #N*C*1   *   N*C*L
+            x_ad = self.ca_input(x_ad) * x_ad #N*C*1   *   N*C*L
+
+            x_d = F.conv1d(x,high_filters.cuda(),padding = 9,groups = 128)
+            x_da = F.conv1d(x_d,high_filters.cuda(),padding = 9,groups = 128)
+            x_dd = F.conv1d(x_d,high_filters.cuda(),padding = 9,groups = 128)
+            x_da = self.ca_input(x_da) * x_da #N*C*1   *   N*C*L
+            x_dd = self.ca_input(x_dd) * x_dd #N*C*1   *   N*C*L
+
+            x = x_aa + x_ad + x_da + x_dd
+            '''
 
         if sys.argv[1] == '2':
             # method 1
@@ -390,7 +464,6 @@ class FIXED_TICNN_AT(nn.Module):
 
         #out = x
         #out = self.downsample_1(out)
-
 
         x = self.layer_128_256_1(x)
         x = self.bn_256_1(x)
@@ -527,7 +600,8 @@ print('----> train data ready')
 
 #else:
 print('----> test data begin')
-data_test = EMGData([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18],#subject
+data_test = EMGData(#[16,17,18],
+                [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18],#subject
                [1,2,3,4,5,6,7,8],                             #gesture  
                #[3]      #trail
                [9,10]  #trail
@@ -558,7 +632,7 @@ else:
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)#,weight_decay=1e-5)
 
-print(summary(model,(128,200),batch_size = 10,device = 'cpu'))
+print(summary(model,[(128,200),(128,1)],batch_size = 10,device = 'cpu'))
 
 if sys.argv[2] == '0':
     # Train the model
@@ -567,14 +641,15 @@ if sys.argv[2] == '0':
     print('Training...')
     for epoch in range(num_epochs):
         model.train()
-        for i, (images, labels) in enumerate(dataloader_train):
+        for i, (images, features,labels) in enumerate(dataloader_train):
             #print('---->' + images + ':' + labels)
             images = images.to(device)
+            features = features.to(device)
             labels = labels.to(device)
             if i == 0:
                 print(labels)
             # Forward pass
-            outputs = model(images)
+            outputs = model(images,features)
             loss = criterion(outputs, labels)
             
             # Backward and optimize
@@ -625,10 +700,11 @@ else:
         total = 0
         correct_list = [0,0,0,0,0,0,0,0]
         confusion_mat = np.zeros((8,8))
-        for images, labels in dataloader_test:
+        for images, features,labels in dataloader_test:
             images = images.to(device)
+            features = features.to(device)
             labels = labels.to(device)
-            outputs = model(images)
+            outputs = model(images,features)
             #print('---->{}'.format(outputs.data[0]))
             _, predicted = torch.max(outputs.data, 1)
             #print(predicted)
