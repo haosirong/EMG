@@ -1,6 +1,7 @@
 import os
 import sys
 import pywt
+import time
 import datetime
 import numpy as np
 import scipy.signal
@@ -23,8 +24,11 @@ batch_size = 256
 learning_rate = 0.001
 channels_num = 128
 
-WINDOW_LEN = 200
-OVERLAP_LEN = 50
+VOTE_SIZE = 27 #it's also test batch
+VOTE_INTERNAL = 5
+
+WINDOW_LEN = 10
+OVERLAP_LEN = 5
 LENGTH = 1000
 SEGMENT_NUM = (LENGTH - (WINDOW_LEN - OVERLAP_LEN)) / OVERLAP_LEN  #18
 wavelet = pywt.Wavelet('db5')
@@ -62,35 +66,63 @@ def select_channel_in_time_domain(aquisition):
 #aquisition = torch.Tensor(data['data']).transpose(1,0)
 #select_channel_in_time_domain(aquisition)
 
+def window_slice_by_vote(data,window_len,vote_internal,vote_size):
+    aquisition = torch.Tensor(data).transpose(1,0) #shape(channel,wave_length)
+    total_length = aquisition.size(1)
+    segments = aquisition[:,0:window_len]
+    segments = segments.reshape(1,-1,window_len)
+
+    count = 1
+
+    time = 0 #incremental window
+    while time + window_len + vote_internal*(vote_size-1) <= total_length:
+        while count < vote_size:
+            segment_inc = aquisition[:,time + vote_internal*count:time + vote_internal*count + window_len]
+            segment_inc1 = segment_inc.reshape(1,-1,window_len)
+            segments = torch.cat((segments,segment_inc1),0)
+            count = count + 1
+        count = 0
+        time = time + window_len + vote_internal*(vote_size-1)
+    return segments
+
 def window_slice(data,window_len,overlap_len):
     aquisition = torch.Tensor(data).transpose(1,0) #shape(channel,wave_length)
     total_length = aquisition.size(1)
-    #channel = aquisition.size(0)
-    #channel_list = select_channel_in_time_domain(aquisition) 
     segments = aquisition[:,0:window_len]
 
     segments = segments.reshape(1,-1,window_len)
 
-    #segment_inc = torch.Tensor(channels_num,window_len)
-    #segment_inc1 = torch.Tensor(1,channels_num,window_len)
-    #print(segments.size())
     time = overlap_len #incremental window
     while time + window_len <= total_length:
         segment_inc = aquisition[:,time:time + window_len]
         segment_inc1 = segment_inc.reshape(1,-1,window_len)
         segments = torch.cat((segments,segment_inc1),0)
         time = time + overlap_len
-    '''
-    print('test')
-    print(segments.size())
-    print(segments)
-    print(channel_list)
-    print(torch.mean(abs(aquisition),1))
-    print(torch.mean(abs(segments),1))
-    '''
     return segments
 
 #window_slice(data['data'],WINDOW_LEN,OVERLAP_LEN)
+
+def load_dataset_by_vote(sub,ges,trail,channel):
+    for i in ges:
+        for j in sub:
+            for k in trail:
+                mat_path = '{0}/{1:03d}-{2:03d}-{3:03d}.mat'.format(j,j,i,k)
+                data = scio.loadmat(mat_path)
+                if trail.index(k) == 0:
+                    trail_total = window_slice_by_vote(data['data'][:,channel],WINDOW_LEN,VOTE_INTERNAL,VOTE_SIZE)
+                else:
+                    trail_single = window_slice_by_vote(data['data'][:,channel],WINDOW_LEN,VOTE_INTERNAL,VOTE_SIZE)
+                    trail_total = torch.cat((trail_total,trail_single),0)
+            if sub.index(j) == 0:
+                sub_total = trail_total
+            else:
+                sub_total = torch.cat((sub_total,trail_total),0)
+        sub_total1 = sub_total.view(1,sub_total.size(0),sub_total.size(1),sub_total.size(2))
+        if ges.index(i) == 0:
+            ges_total = sub_total1
+        else:
+            ges_total = torch.cat((ges_total,sub_total1),0) 
+    return ges_total
 
 def load_dataset(sub,ges,trail,channel):
     for i in ges:
@@ -113,7 +145,6 @@ def load_dataset(sub,ges,trail,channel):
         else:
             ges_total = torch.cat((ges_total,sub_total1),0) 
     return ges_total
-
 '''
 dataset_whole = load_dataset([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18],[1,2,3,4,5,6,7,8],[1,2,3,4,5,6,7,8,9,10]) #shape ---> [gesture_type,number,channel,wave_length]
 
@@ -142,7 +173,10 @@ class EMGData(Dataset): #继承Dataset
         #self.root_dir = root_dir   #文件目录
         #self.transform = transform #变换
         #self.images = os.listdir(self.root_dir)#目录里的所有文件
-        self.dataset = load_dataset(sub,ges,trail,channel) #shape ---> [gesture_type,number,channel,wave_length]
+        if sys.argv[2] == '0':
+            self.dataset = load_dataset(sub,ges,trail,channel) #shape ---> [gesture_type,number,channel,wave_length]
+        else:# vote just for test cuz data may have overlap
+            self.dataset = load_dataset_by_vote(sub,ges,trail,channel) #shape ---> [gesture_type,number,channel,wave_length]
         #self.dataset = torch.norm(torch.rfft(self.dataset,1),p=2,dim=4)
 
         print('----- > emg tensor size')
@@ -150,26 +184,17 @@ class EMGData(Dataset): #继承Dataset
         self.gesture_type = self.dataset.size(0)
         self.number = self.dataset.size(1)
         self.len = self.gesture_type * self.number
-
+        '''
         mean = torch.abs(self.dataset).transpose(2,0)
         mean = torch.mean(mean,-1)
         mean = torch.mean(mean,-1)
         mean = torch.mean(mean,-1)
         #print(mean.reshape(16,8))
         
-        self.features_rms = torch.sqrt(torch.mean(self.dataset*self.dataset,3)).reshape(self.gesture_type,self.number,1,-1,8)
-        #f_max = torch.max(features_rms).item()
-        #f_min = torch.min(features_rms).item()
-        #f_mean = torch.mean(features_rms).item()
-        #f_std = torch.std(features_rms).item()
 
         y1 = self.dataset[:,:,:,0:WINDOW_LEN - 1]
         y2 = self.dataset[:,:,:,1:WINDOW_LEN]
-        self.features_wl = torch.sum(abs(y1 - y2),3).reshape(self.gesture_type,self.number,1,-1,8)
-        #f_max = torch.max(features_wl).item()
-        #f_min = torch.min(features_wl).item()
-        #f_mean = torch.mean(features_wl).item()
-        #f_std = torch.std(features_wl).item()
+        self.features_wl = torch.sum(abs(y1 - y2),3).reshape(self.gesture_type,self.number,1,16,8)
         x1 = torch.sign(self.dataset[:,:,:,0:WINDOW_LEN - 1])
         x2 = torch.sign(self.dataset[:,:,:,1:WINDOW_LEN])
         zc = torch.eq(x1,x2)
@@ -180,6 +205,8 @@ class EMGData(Dataset): #继承Dataset
         x = torch.norm(torch.rfft(self.dataset,1),p=2,dim=4)
         y = torch.linspace(0,100,101).reshape(101,1)
         self.features_sn = torch.matmul(x*x,y).reshape(self.gesture_type,self.number,1,16,8)
+        '''
+        self.features_rms = torch.sqrt(torch.mean(self.dataset*self.dataset,3)).reshape(self.gesture_type,self.number,1,16,8)
 
     def __len__(self):#返回整个数据集的大小
         #return len(self.images)
@@ -192,12 +219,12 @@ class EMGData(Dataset): #继承Dataset
         #print('{0}:{1}'.format(label,num))
         data = self.dataset[label,num] 
         feature_rms = self.features_rms[label,num] 
-        feature_wl = self.features_wl[label,num] 
-        feature_zc = self.features_zc[label,num] 
-        feature_sn = self.features_sn[label,num] 
+        #feature_wl = self.features_wl[label,num] 
+        #feature_zc = self.features_zc[label,num] 
+        #feature_sn = self.features_sn[label,num] 
         #sample = {'data111':data,'label222':label}
-        return data,torch.cat((feature_rms,feature_wl,feature_zc,feature_sn),dim=0),label
-        #return data,feature_rms,label
+        #return data,torch.cat((feature_rms,feature_wl,feature_zc,feature_sn),dim=0),label
+        return data,feature_rms,label
 
 class ChannelAttention(nn.Module):
     def __init__(self, in_planes, ratio=16,init_weights=True):
@@ -213,7 +240,8 @@ class ChannelAttention(nn.Module):
         #auxiliary convnet
         self.bn2 = nn.BatchNorm2d(1)
         self.bn3 = nn.BatchNorm2d(512)
-        self.conv1 = nn.Conv2d(4, 256, 3, padding=1, bias=False,groups = 4)
+        #self.conv1 = nn.Conv2d(4, 256, 3, padding=1, bias=False,groups = 4)
+        self.conv1 = nn.Conv2d(1, 256, 3, padding=1, bias=False)
         self.conv2 = nn.Conv2d(256, 256, 1, bias=False)#,groups = 2)
         self.fc = nn.Linear(128*256,128,bias=False)
         '''
@@ -452,7 +480,8 @@ class FIXED_TICNN_AT(nn.Module):
 
 
     #def forward(self, x, length):
-    def forward(self, x, y):
+    #def forward(self, x, y):
+    def forward(self, x):
 
         # Covolutions
         '''
@@ -516,10 +545,10 @@ class FIXED_TICNN_AT(nn.Module):
                     else:
                         x3 = torch.cat([x3,x[:,[16*i+2*j,16*i+2*j+1,16*i+2*j+8,16*i+2*j+9],:]],dim=1)
             x = self.group_cnn_32(x3)
+            '''
 
             x = self.bn_128(x)
             x = self.relu(x)
-            '''
 
         #if sys.argv[1] == '3':
             #x = self.ca_input(x)*x #N*C*1   *   N*C*L
@@ -655,40 +684,44 @@ def fixedticnn16at_bn(**kwargs):
 
 #Data Loader
 
-#if sys.argv[2] == '0':
-print('----> train data begin')
-data_train = EMGData([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18],#subject
+if sys.argv[2] == '0':
+    time = time.strftime('%Y%m%d%H%M',time.localtime(time.time()))
+    writer = SummaryWriter(logdir='runs/'+time)
+    print('----> train data begin')
+    data_train = EMGData([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18],#subject
                #[1],
                [1,2,3,4,5,6,7,8],                             #gesture  
                #[1,2]                         #trail
-               [1,2,3,4,5,6,7]                         #trail
+               [1,3,5,7,9]                         #trail
                )#初始化类，设置数据集所在路径以及变换
 
-dataloader_train = DataLoader(data_train,batch_size=batch_size,shuffle=True)#使用DataLoader加载数据
-print('----> train data ready')
+    dataloader_train = DataLoader(data_train,batch_size=batch_size,shuffle=True)#使用DataLoader加载数据
+    print('----> train data ready')
 
-#else:
-print('----> test data begin')
-data_test = EMGData(#[16,17,18],
+    print('----> validation data begin')
+    data_val = EMGData(#[16,17,18],
                 [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18],#subject
                [1,2,3,4,5,6,7,8],                             #gesture  
                #[3]      #trail
-               [8,9,10]  #trail
+               [2,4,6,8,10]  #trail
                )#初始化类，设置数据集所在路径以及变换
 
-dataloader_test = DataLoader(data_test,batch_size=batch_size,shuffle=False)#使用DataLoader加载数据
-print('----> test data ready')
+    dataloader_val = DataLoader(data_val,batch_size=batch_size,shuffle=False)#使用DataLoader加载数据
+    print('----> validation data ready')
 
-print('----> validation data begin')
-data_val = EMGData(#[16,17,18],
+else:
+    print('----> test data begin')
+    data_test = EMGData(#[16,17,18],
                 [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18],#subject
                [1,2,3,4,5,6,7,8],                             #gesture  
                #[3]      #trail
-               [8]  #trail
+               [2,4,6,8,10]  #trail
                )#初始化类，设置数据集所在路径以及变换
 
-dataloader_val = DataLoader(data_val,batch_size=batch_size,shuffle=False)#使用DataLoader加载数据
-print('----> validation data ready')
+    dataloader_test = DataLoader(data_test,batch_size=256,shuffle=False)#使用DataLoader加载数据
+    print('----> test data ready')
+    total_test = data_test.__len__() / VOTE_SIZE
+
 #model
 
 if torch.cuda.is_available():
@@ -711,7 +744,8 @@ else:
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)#,weight_decay=1e-5)
 
-#print(summary(model,[(128,200),(2,16,8)],batch_size = 10,device = 'cpu'))
+#print(summary(model,[(128,200),(1,16,8)],batch_size = 10,device = 'cpu'))
+print(summary(model,(128,WINDOW_LEN),batch_size = 10,device = 'cpu'))
 
 if sys.argv[2] == '0':
     # Train the model
@@ -721,6 +755,8 @@ if sys.argv[2] == '0':
     for epoch in range(num_epochs):
         model.train()
         loss_acc = 0
+        correct = 0
+        total = 0
         for i, (images, features,labels) in enumerate(dataloader_train):
             #print('---->' + images + ':' + labels)
             images = images.to(device)
@@ -729,32 +765,51 @@ if sys.argv[2] == '0':
             if i == 0:
                 print(labels)
             # Forward pass
-            outputs = model(images,features)
+            #outputs = model(images,features)
+            outputs = model(images)
             loss = criterion(outputs, labels)
             loss_acc += loss.item() 
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
             # Backward and optimize
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
         print ('Train      Epoch [{}/{}], Step [{}/{}], Loss: {:.7f},Time:{}' .format(epoch+1, num_epochs, i+1, total_step, loss_acc,datetime.datetime.now()))
+        print(correct,",",correct/total)
         writer.add_scalar('train', loss_acc, global_step=epoch)
         loss_list.append(loss.item())
 
         model.eval()
         with torch.no_grad():
             loss_acc = 0
+            correct = 0
+            total = 0
+            correct_list = [0,0,0,0,0,0,0,0]
             for i, (images, features,labels) in enumerate(dataloader_val):
                 #print('---->' + images + ':' + labels)
                 images = images.to(device)
                 features = features.to(device)
                 labels = labels.to(device)
                 # Forward pass
-                outputs = model(images,features)
+                #outputs = model(images,features)
+                outputs = model(images)
                 loss = criterion(outputs, labels)
                 loss_acc += loss.item() 
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+                correct_label = (predicted == labels)
+                for j in range(num_classes):
+                    correct_ele = (predicted == j)
+                    correct_list[j] = correct_list[j] + (correct_label & correct_ele).sum().item()#(predicted == i).sum().item()
+
             writer.add_scalar('validation', loss_acc, global_step=epoch)
             print ('Validation Epoch [{}/{}], Step [{}/{}], Loss: {:.7f},Time:{}' .format(epoch+1, num_epochs, i+1, total_step, loss_acc,datetime.datetime.now()))
+            print(correct,",",correct/total)
+            print(correct_list)
 
         
 
@@ -781,6 +836,7 @@ if sys.argv[2] == '0':
         '''
     # Save the model checkpoint
     torch.save(model.state_dict(), 'model.ckpt')
+    writer.close()
 
 else:
     #Load model
@@ -800,32 +856,46 @@ else:
         total = 0
         correct_list = [0,0,0,0,0,0,0,0]
         confusion_mat = np.zeros((8,8))
+        tic = datetime.datetime.now()
         for images, features,labels in dataloader_test:
+            vote_barrel = [0,0,0,0,0,0,0,0]
             images = images.to(device)
             features = features.to(device)
             labels = labels.to(device)
-            outputs = model(images,features)
+            #outputs = model(images,features)
+            outputs = model(images)
             #print('---->{}'.format(outputs.data[0]))
             _, predicted = torch.max(outputs.data, 1)
-            #print(predicted)
+            print(labels)
+            print(predicted)
             for i in range(labels.size(0)):
-                confusion_mat[labels[i]][predicted[i]] = confusion_mat[labels[i]][predicted[i]] + 1
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-            correct_label = (predicted == labels)
-            for i in range(8):
-                correct_ele = (predicted == i)
-                correct_list[i] = correct_list[i] + (correct_label & correct_ele).sum().item()#(predicted == i).sum().item()
+                vote_barrel[predicted[i]] = vote_barrel[predicted[i]] + 1
+                #confusion_mat[labels[i]][predicted[i]] = confusion_mat[labels[i]][predicted[i]] + 1
+            vote_result = vote_barrel.index(max(vote_barrel))
+            print(vote_barrel)
+            print(vote_result)
+            total += 1
+            if vote_result == labels[0]:
+                correct = correct + 1
+            #correct_label = (predicted == labels)
+            #for i in range(8):
+            #    correct_ele = (predicted == i)
+            #    correct_list[i] = correct_list[i] + (correct_label & correct_ele).sum().item()#(predicted == i).sum().item()
                 #for j in range(8):
                 #    correct_list[i] = correct_list[i] + (correct_label & correct_ele).sum().item()#(predicted == i).sum().item()
         #if epoch % 5 == 0:
         #    acc = 100 * correct / total 
         #    acc_list.append(acc)
+        tac = datetime.datetime.now()
+        print(correct,total,total_test)
+        delta = (tac - tic)
+        elapse = delta.seconds*1000000 + delta.microseconds
+        print(elapse,elapse/total_test)
         print('Test Accuracy of the model {}: {} %'.format(sys.argv[1],100 * correct / total))
-        print(correct_list)
-        for i in range(8):
-            print('Label {} Accuracy:{} %'.format(i,100*correct_list[i]/(total/8)))
-        print(confusion_mat)
+        #print(correct_list)
+        #for i in range(8):
+        #    print('Label {} Accuracy:{} %'.format(i,100*correct_list[i]/(total/8)))
+        #print(confusion_mat)
     '''
     _, ax1 = plt.subplots()
     ax2 = ax1.twinx()
@@ -840,4 +910,3 @@ else:
     plt.legend(handles1+handles2 , labels1+labels2, loc='upper right')
     plt.show()
     '''
-writer.close()

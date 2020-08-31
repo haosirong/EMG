@@ -14,17 +14,18 @@ from torch.utils.data import DataLoader,Dataset
 from torchvision import transforms
 from torchsummary import summary
 from tensorboardX import SummaryWriter
+from thop import profile
 
 
 
 # Hyper parameters
-num_epochs = 50
+num_epochs = 80
 num_classes = 27
 batch_size = 256
 learning_rate = 0.001
 channels_num = 168
 
-WINDOW_LEN = 256
+WINDOW_LEN = 6144
 OVERLAP_LEN = 128
 LENGTH = 1000
 SEGMENT_NUM = (LENGTH - (WINDOW_LEN - OVERLAP_LEN)) / OVERLAP_LEN  #18
@@ -33,9 +34,25 @@ low_filter = torch.Tensor(wavelet.dec_lo[::-1])
 high_filter = torch.Tensor(wavelet.dec_hi[::-1])
 low_filters = low_filter.repeat(128,1).reshape(128,1,10).cuda()
 high_filters = high_filter.repeat(128,1).reshape(128,1,10).cuda()
+e_data = scio.loadmat('duration.mat')
+start_time = (e_data['XLSX'].T[5] - 300).reshape(5,5,27,10)
+
+#csl = torch.load('s_data_total.t').reshape(27,5,5,10,168,6144)
+
+def butter_bandpass_filter(data, lowcut, highcut, fs, order):
+    from scipy.signal import butter, lfilter 
+
+    nyq = 0.5 * fs
+    low = lowcut / nyq 
+    high = highcut / nyq 
+
+    b, a = butter(order, [low, high], btype='bandpass')
+    y = lfilter(b, a, data)
+    return y
 
 
-def window_slice(data,window_len,overlap_len):
+
+def window_slice0(data,window_len,overlap_len):
     aquisition = torch.Tensor(data) #shape(channel,wave_length)
     total_length = aquisition.size(1)
     segments = aquisition[:,0:window_len]
@@ -51,34 +68,100 @@ def window_slice(data,window_len,overlap_len):
         segment_inc1 = segment_inc.reshape(1,-1,window_len)
         segments = torch.cat((segments,segment_inc1),0)
         time = time + overlap_len
-    '''
-    print('test')
-    print(segments.size())
-    print(segments)
-    print(channel_list)
-    print(torch.mean(abs(aquisition),1))
-    print(torch.mean(abs(segments),1))
-    '''
     return segments
 
+def window_slice(data,window_len,overlap_len):
+    rms = np.sqrt(np.mean(np.square(data), axis=1)) 
+    threshold = np.mean(rms)
+    print(threshold)
+    aquisition = torch.Tensor(data) #shape(channel,wave_length)
+    total_length = aquisition.size(1)
+    segments = aquisition[:,0:window_len]
+    count=0
+    
+    has_head = False
+    rms_segment = torch.mean(torch.sqrt(torch.mean(segments*segments,1)))
+    segments = segments.reshape(1,-1,window_len)
+    if(rms_segment.cpu().numpy() > threshold):
+        count = count +1
+        has_head = True
+
+    #segment_inc = torch.Tensor(channels_num,window_len)
+    #segment_inc1 = torch.Tensor(1,channels_num,window_len)
+    #print(segments.size())
+    time = overlap_len #incremental window
+    while time + window_len <= total_length:
+        segment_inc = aquisition[:,time:time + window_len]
+        rms_segment = torch.mean(torch.sqrt(torch.mean(segment_inc*segment_inc,1)))
+        if(rms_segment.cpu().numpy() > threshold):
+            segment_inc1 = segment_inc.reshape(1,-1,window_len)
+            if has_head == True:
+                segments = torch.cat((segments,segment_inc1),0)
+            else:
+                segments = segment_inc1
+                has_head = True
+            count = count +1
+        time = time + overlap_len
+
+    #print(segments.shape,count)
+    return segments,count
+
 #window_slice(data['data'],WINDOW_LEN,OVERLAP_LEN)
+def alignment(begin,end,start,terminate,maximum,delta,window): #start 0 terminate 39
+    upper_b = maximum + delta
+    lower_b = maximum - delta
+    if upper_b > terminate:
+        diff = upper_b - terminate
+        upper_b = upper_b - diff
+        lower_b = lower_b - diff
+    else:
+         if lower_b < start:
+            diff = start - lower_b
+            upper_b = upper_b + diff
+            lower_b = lower_b + diff
+    return window*lower_b,window*upper_b
+    
 
 def load_dataset(sub,ses,ges,tri):
+    label = torch.ones(1) #placeholder
+    counts = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
     for i in ges:
         for j in ses:
             for k in sub:
                 mat_path = 'subject{0}/session{1}/gest{2}.mat'.format(k,j,i)
                 data = scio.loadmat(mat_path)
                 for l in tri:
-                    trial = data['gestures'][tri.index(l),0]
+                    #if k == 4 and j == 4 and (i == 8 or i ==9) and l == 9: # coral error
+                    #    continue
+                    #else:
+                    trial = data['gestures'][l,0]
                     trial = np.delete(trial,np.s_[7:192:8],0)
+                    trial = np.array([butter_bandpass_filter(ch, 20, 400, 2048, 4) for ch in trial])
+                    time = start_time[k-1,j-1,i,l]
+                    
+                    window = 150 
+                    data = np.transpose(trial)
+                    data = data[:len(data) // window * window].reshape(-1, window, data.shape[1])
+                    rms = np.sqrt(np.mean(np.square(data), axis=1))
+                    rms_list = rms.tolist()
+                    rms_max_index = rms_list.index(max(rms_list))
+
+                    lower,upper = alignment(0,0,0,len(data) // window,rms_max_index,2,window)
+
                     if tri.index(l) == 0:
-                        trial_total = window_slice(trial,WINDOW_LEN,OVERLAP_LEN)
                         print('subject{0}/session{1}/gest{2}.mat'.format(k,j,i))
-                        print(trial_total[0,0,0])
+                        print(lower,upper)
+                        trial_total = window_slice0(trial[:,lower:upper],WINDOW_LEN,OVERLAP_LEN)
+                        #trial_total = torch.Tensor(trial[:,time:time+300]).reshape(1,168,300)
+                        
+                        #trial_total,count = window_slice(trial,WINDOW_LEN,OVERLAP_LEN)
                     else:
-                        trial_single = window_slice(trial,WINDOW_LEN,OVERLAP_LEN)
+                        trial_single = window_slice0(trial[:,lower:upper],WINDOW_LEN,OVERLAP_LEN)
+                        #trial_single = torch.Tensor(trial[:,time:time+300]).reshape(1,168,300)
+                        #trial_single,count = window_slice(trial,WINDOW_LEN,OVERLAP_LEN)
                         trial_total = torch.cat((trial_total,trial_single),0)
+                    #counts[i] = counts[i] + count
+                    #label = torch.cat((label,torch.ones(count)*i),0) ####
                 if sub.index(k) == 0:
                     sub_total = trial_total
                 else:
@@ -91,32 +174,50 @@ def load_dataset(sub,ses,ges,tri):
             ges_total = ses_total
         else:
             ges_total = torch.cat((ges_total,ses_total),0) 
+    '''
+    print(label.shape)
+    print(ges_total.shape)
+    print(counts)
+    return ges_total,label[1:]
+    '''
     return ges_total
 
-
 class EMGData(Dataset): #继承Dataset
-    def __init__(self,sub,ses,ges,trial): #__init__是初始化该类的一些基础参数
+    def __init__(self,sub,ses,ges,trial,is_train = False): #__init__是初始化该类的一些基础参数
         #self.root_dir = root_dir   #文件目录
         #self.transform = transform #变换
         #self.images = os.listdir(self.root_dir)#目录里的所有文件
+        #self.dataset,self.label = load_dataset(sub,ses,ges,trial) #shape ---> [total_number,channel,wave_length]
         self.dataset = load_dataset(sub,ses,ges,trial) #shape ---> [total_number,channel,wave_length]
         #self.dataset = torch.norm(torch.rfft(self.dataset,1),p=2,dim=4)
-
+        '''
+        self.dataset = csl[ges]#.reshape(-1,168,300)
+        self.dataset = self.dataset[:,[i -1 for i in  ses]] #index from 1 ,need substract 1
+        self.dataset = self.dataset[:,:,[i -1 for i in  sub]]#.reshape(-1,168,300)
+        self.dataset = self.dataset[:,:,:,trial]#.reshape(-1,168,300)
+        self.dataset = self.dataset[:,:,:,:,:,0::2] #2 downsample
+        self.dataset = self.dataset.reshape(-1,168,3072)
+        '''
+        
         print('----- > emg tensor size')
         print(self.dataset.size())
+        #if is_train == True:
+        print("Save ...")
+        torch.save(self.dataset,'s_data_total.t')
         self.len = self.dataset.size(0)
         self.number = self.len // num_classes #each gesture number
         self.gesture_type = num_classes
         
-        self.features_rms = torch.sqrt(torch.mean(self.dataset*self.dataset,2)).reshape(self.len,24,7)
+        self.features_rms = torch.sqrt(torch.mean(self.dataset*self.dataset,2)).reshape(self.len,1,24,7)
         #f_max = torch.max(features_rms).item()
         #f_min = torch.min(features_rms).item()
         #f_mean = torch.mean(features_rms).item()
         #f_std = torch.std(features_rms).item()
-
+        
+        '''
         y1 = self.dataset[:,:,0:WINDOW_LEN - 1]
         y2 = self.dataset[:,:,1:WINDOW_LEN]
-        self.features_wl = torch.sum(abs(y1 - y2),2).reshape(self.len,24,7)
+        self.features_wl = torch.sum(abs(y1 - y2),2).reshape(self.len,1,24,7)
         #f_max = torch.max(features_wl).item()
         #f_min = torch.min(features_wl).item()
         #f_mean = torch.mean(features_wl).item()
@@ -125,12 +226,13 @@ class EMGData(Dataset): #继承Dataset
         x2 = torch.sign(self.dataset[:,:,1:WINDOW_LEN])
         zc = torch.eq(x1,x2)
         zc_sum = WINDOW_LEN - torch.sum(zc,2)
-        self.features_zc = zc_sum.reshape(self.len,24,7)
+        self.features_zc = zc_sum.reshape(self.len,1,24,7)
         self.features_zc = self.features_zc.type(torch.FloatTensor)
         
         x = torch.norm(torch.rfft(self.dataset,1),p=2,dim=3)
-        y = torch.linspace(0,128,129).reshape(129,1)
-        self.features_sn = torch.matmul(x*x,y).reshape(self.len,24,7)
+        y = torch.linspace(0,150,151).reshape(151,1)
+        self.features_sn = torch.matmul(x*x,y).reshape(self.len,1,24,7)
+        '''
 
     def __len__(self):#返回整个数据集的大小
         #return len(self.images)
@@ -139,15 +241,17 @@ class EMGData(Dataset): #继承Dataset
     def __getitem__(self,index):#根据索引index返回dataset[index]
         
         label = index // self.number
+        #label = self.label[index].item()
+        #label = int(label)
         #print('{0}:{1}'.format(label,num))
         data = self.dataset[index] 
         feature_rms = self.features_rms[index] 
-        feature_wl = self.features_wl[index] 
-        feature_zc = self.features_zc[index] 
-        feature_sn = self.features_sn[index] 
+        #feature_wl = self.features_wl[index] 
+        #feature_zc = self.features_zc[index] 
+        #feature_sn = self.features_sn[index] 
         #sample = {'data111':data,'label222':label}
-        return data,torch.cat((feature_rms,feature_wl,feature_zc,feature_sn),dim=0),label
-        #return data,feature_rms,label
+        #return data,torch.cat((feature_rms,feature_wl,feature_zc,feature_sn),dim=0),label
+        return data,feature_rms,label
 
 class ChannelAttention(nn.Module):
     def __init__(self, in_planes, ratio=16,init_weights=True):
@@ -163,9 +267,9 @@ class ChannelAttention(nn.Module):
         #auxiliary convnet
         self.bn2 = nn.BatchNorm2d(1)
         self.bn3 = nn.BatchNorm2d(512)
-        self.conv1 = nn.Conv2d(4, 256, 3, padding=1, bias=False,groups = 4)
+        self.conv1 = nn.Conv2d(1, 256, 3, padding=1, bias=False)#,groups = 4)
         self.conv2 = nn.Conv2d(256, 256, 1, bias=False)#,groups = 2)
-        self.fc = nn.Linear(128*256,128,bias=False)
+        self.fc = nn.Linear(168*256,168,bias=False)
         '''
         self.fc1   = nn.Conv1d(16, 8, 1, bias=False)
         self.fc1_   = nn.Conv1d(8, 4, 1, bias=False)
@@ -276,7 +380,7 @@ class ChannelAttention(nn.Module):
         #avg_out = self.relu1(avg_out)
         avg_out = self.fc(avg_out.reshape(x.size(0),-1))
         #out = avg_out + max_out
-        return self.sigmoid(avg_out).reshape(x.size(0),128,1)
+        return self.sigmoid(avg_out).reshape(x.size(0),168,1)
         #return self.softmax(out)
         '''
         if layer == 1:
@@ -353,6 +457,7 @@ class FIXED_TICNN_AT(nn.Module):
 
         self.layer_128_128 = nn.Conv1d(128, 128, kernel_size=1)
         self.bn_128 = nn.BatchNorm1d(128)
+        self.bn_168 = nn.BatchNorm1d(168)
 
         self.layer_168_256_1 = nn.Conv1d(168, 256, kernel_size=3, padding=1)
         self.bn_256_1 = nn.BatchNorm1d(256)
@@ -371,13 +476,15 @@ class FIXED_TICNN_AT(nn.Module):
         self.downsample_2 = nn.Sequential(nn.Conv1d(256, 256, kernel_size=1, stride=3),nn.BatchNorm1d(256))
         self.downsample_3 = nn.Sequential(nn.Conv1d(256, 256, kernel_size=1, stride=3),nn.BatchNorm1d(256))
 
-        self.group_cnn_64 = nn.Conv1d(channels_num, 168, kernel_size=1, groups = 42) # aggragate spatial channel
+        self.group_cnn_42 = nn.Conv1d(channels_num, 168, kernel_size=1, groups = 42) # aggragate spatial channel
         self.group_cnn_8 = nn.Conv1d(channels_num, 168, kernel_size=1, groups = 8) # aggragate spatial channel
-        self.group_cnn_4 = nn.Conv1d(channels_num, 168, kernel_size=1, groups = 6) # aggragate spatial channel
-        self.group_cnn_2 = nn.Conv1d(channels_num, 168, kernel_size=1, groups = 3) # aggragate spatial channel
-        self.group_cnn_16 = nn.Conv1d(channels_num, 168, kernel_size=1, groups = 12) # aggragate spatial channel
-        self.group_cnn_32 = nn.Conv1d(channels_num, 168, kernel_size=1, groups = 84) # aggragate spatial channel
-        self.group_cnn_128 = nn.Conv1d(channels_num, 168, kernel_size=1, groups = 168) # aggragate spatial channel
+        self.group_cnn_6 = nn.Conv1d(channels_num, 168, kernel_size=1, groups = 6) # aggragate spatial channel
+        self.group_cnn_3 = nn.Conv1d(channels_num, 168, kernel_size=1, groups = 3) # aggragate spatial channel
+        self.group_cnn_2 = nn.Conv1d(channels_num, 168, kernel_size=1, groups = 2) # aggragate spatial channel
+        self.group_cnn_12 = nn.Conv1d(channels_num, 168, kernel_size=1, groups = 12) # aggragate spatial channel
+        self.group_cnn_24 = nn.Conv1d(channels_num, 168, kernel_size=1, groups = 24) # aggragate spatial channel
+        self.group_cnn_84 = nn.Conv1d(channels_num, 168, kernel_size=1, groups = 84) # aggragate spatial channel
+        self.group_cnn_168 = nn.Conv1d(channels_num, 168, kernel_size=1, groups = 168) # aggragate spatial channel
         self.group_cnn_256 = nn.Conv1d(256, 256, kernel_size=1, groups = 256) # aggragate spatial channel
         self.group_cnn_512 = nn.Conv1d(512, 512, kernel_size=1, groups = 512) # aggragate spatial channel
         self.ca_input = ChannelAttention(168)	
@@ -401,8 +508,8 @@ class FIXED_TICNN_AT(nn.Module):
             self._initialize_weights()
 
 
-    #def forward(self, x, length):
-    def forward(self, x, y):
+    #def forward(self, x, y):
+    def forward(self, x):
 
         # Covolutions
         '''
@@ -426,10 +533,10 @@ class FIXED_TICNN_AT(nn.Module):
             #z = torch.matmul(x2*x2,y).reshape(x.size(0),1,16,8)
             #x = self.ca_input(z) * x #N*C*1   *   N*C*L
             #z = torch.mean(x*x,2).reshape(x.size(0),x.size(1),1)
-            #x = self.ca_input(y[:,0,:,:].reshape(x.size(0),1,16,8)) * x #N*C*1   *   N*C*L
+            #x = self.ca_input(y[:,0,:,:].reshape(x.size(0),1,24,7)) * x #N*C*1   *   N*C*L
 
             #sqrt_avg_pool = torch.sqrt(torch.mean(x*x,2)).reshape(x.size(0),x.size(1),1)
-            x = self.ca_input(y) * x #N*C*1   *   N*C*L
+            #x = self.ca_input(y) * x #N*C*1   *   N*C*L
             #x = self.ca_input(x)*x #N*C*1   *   N*C*L
             
             '''
@@ -450,8 +557,7 @@ class FIXED_TICNN_AT(nn.Module):
 
         if sys.argv[1] == '2':
             # method 1
-            x = self.group_cnn_128(x)
-
+            x = self.group_cnn_24(x)
             # method 2
             #x = x.reshape(x.size(0),16,8,WINDOW_LEN).transpose(2,1).reshape(x.size(0),128,WINDOW_LEN)
             #x = self.group_cnn_16(x)
@@ -466,10 +572,10 @@ class FIXED_TICNN_AT(nn.Module):
                     else:
                         x3 = torch.cat([x3,x[:,[16*i+2*j,16*i+2*j+1,16*i+2*j+8,16*i+2*j+9],:]],dim=1)
             x = self.group_cnn_32(x3)
-
-            x = self.bn_128(x)
-            x = self.relu(x)
             '''
+
+            x = self.bn_168(x)
+            x = self.relu(x)
 
         #if sys.argv[1] == '3':
             #x = self.ca_input(x)*x #N*C*1   *   N*C*L
@@ -483,7 +589,8 @@ class FIXED_TICNN_AT(nn.Module):
 
         #out = x
         #out = self.downsample_1(out)
-
+        #print(x[0,:,0].reshape(24,7))
+        #print(x.cpu().numpy()[0,:,0])
         x = self.layer_168_256_1(x)
         x = self.bn_256_1(x)
         x = self.relu(x)
@@ -606,7 +713,7 @@ def fixedticnn16at_bn(**kwargs):
 
 if sys.argv[2] == '0':
     time = time.strftime('%Y%m%d%H%M',time.localtime(time.time()))
-    writer = SummaryWriter(logdir='runs/'+time)
+    writer = SummaryWriter(logdir='runs/'+time+'_'+sys.argv[1])
     print('----> train data begin')
     data_train = EMGData(
                #[1],#subject
@@ -615,8 +722,8 @@ if sys.argv[2] == '0':
                [1,2,3,4,5],#session
                [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26],#gesture  
                #[0,1],#gesture  
-               #[1,3,5,7,9]                         #trial
-               [1]                         #trial
+               [0,1,2,3,4,5,6,7]                         #trial
+                ,True
                )#初始化类，设置数据集所在路径以及变换
 
     dataloader_train = DataLoader(data_train,batch_size=batch_size,shuffle=True)#使用DataLoader加载数据
@@ -629,7 +736,7 @@ if sys.argv[2] == '0':
                #[1],#session
                [1,2,3,4,5],#session
                [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26],#gesture  
-               [2,4,6,8,10],  #trial
+               [8,9],  #trial
                #[6,7,8,9,10]                         #trial
                )#初始化类，设置数据集所在路径以及变换
 
@@ -640,11 +747,11 @@ else:
     data_test = EMGData(
                #[1],#subject
                [1,2,3,4,5],#subject
-               [2],#session
-               #[1,2,3,4,5],#session
+               #[1],#session
+               [1,2,3,4,5],#session
                [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26],#gesture  
                #[0,1],
-               [4,6,8,10]                         #trial
+               [2,4,6,8]                         #trial
                )#初始化类，设置数据集所在路径以及变换
 
     dataloader_test = DataLoader(data_test,batch_size=batch_size,shuffle=False)#使用DataLoader加载数据
@@ -668,7 +775,11 @@ else:
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)#,weight_decay=1e-5)
 
-#print(summary(model,[(128,200),(2,16,8)],batch_size = 10,device = 'cpu'))
+#print(summary(model,[(168,200),(1,24,7)],batch_size = 10,device = 'cpu'))
+print(summary(model,(168,200),batch_size = 10,device = 'cpu'))
+#input_data = torch.randn(1, 168, 200).cuda()
+#macs, params = profile(model, inputs=(input_data, ))
+#print(macs,params)
 
 if sys.argv[2] == '0':
     # Train the model
@@ -678,6 +789,8 @@ if sys.argv[2] == '0':
     for epoch in range(num_epochs):
         model.train()
         loss_acc = 0
+        correct = 0
+        total = 0
         for i, (images, features,labels) in enumerate(dataloader_train):
             #print('---->' + images + ':' + labels)
             images = images.to(device)
@@ -686,16 +799,23 @@ if sys.argv[2] == '0':
             if i == 0:
                 print(labels)
             # Forward pass
-            outputs = model(images,features)
+            outputs = model(images)
+            #outputs = model(images,features)
             loss = criterion(outputs, labels)
             loss_acc += loss.item() 
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
             # Backward and optimize
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-        print ('Train      Epoch [{}/{}], Step [{}/{}], Loss: {:.7f},Time:{}' .format(epoch+1, num_epochs, i+1, total_step, loss_acc,datetime.datetime.now()))
-        writer.add_scalar('train', loss_acc, global_step=epoch)
+        print ('Train      Epoch [{}/{}], Step [{}/{}], Loss: {:.7f},Time:{},Num Correct:{},Accuracy:{}' .format(epoch+1, num_epochs, i+1, total_step, loss_acc,datetime.datetime.now(),correct,correct/total))
+        #print(correct,",",correct/total)
+        #writer.add_scalars('train', {'loss':loss_acc,'acc':correct/total}, global_step=epoch)
+        writer.add_scalar('train_loss', loss_acc, global_step=epoch)
+        writer.add_scalar('train_acc', correct/total, global_step=epoch)
         loss_list.append(loss.item())
 
         model.eval()
@@ -705,12 +825,14 @@ if sys.argv[2] == '0':
             total = 0
             correct_list = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
             for i, (images, features,labels) in enumerate(dataloader_val):
+            #for i, (images,labels) in enumerate(dataloader_val):
                 #print('---->' + images + ':' + labels)
                 images = images.to(device)
                 features = features.to(device)
                 labels = labels.to(device)
                 # Forward pass
-                outputs = model(images,features)
+                #outputs = model(images,features)
+                outputs = model(images)
                 loss = criterion(outputs, labels)
                 loss_acc += loss.item() 
                 _, predicted = torch.max(outputs.data, 1)
@@ -721,9 +843,11 @@ if sys.argv[2] == '0':
                     correct_ele = (predicted == j)
                     correct_list[j] = correct_list[j] + (correct_label & correct_ele).sum().item()#(predicted == i).sum().item()
 
-            writer.add_scalar('validation', loss_acc, global_step=epoch)
-            print ('Validation Epoch [{}/{}], Step [{}/{}], Loss: {:.7f},Time:{}' .format(epoch+1, num_epochs, i+1, total_step, loss_acc,datetime.datetime.now()))
-            print(correct)
+            #writer.add_scalars('validation', {'loss':loss_acc,'acc':correct/total}, global_step=epoch)
+            writer.add_scalar('validation_loss', loss_acc, global_step=epoch)
+            writer.add_scalar('validation_acc', correct/total, global_step=epoch)
+            print ('Validation Epoch [{}/{}], Step [{}/{}], Loss: {:.7f},Time:{},Num Correct:{},Accuracy:{}' .format(epoch+1, num_epochs, i+1, total_step, loss_acc,datetime.datetime.now(),correct,correct/total))
+            #print(correct,",",correct/total)
             print(correct_list)
 
         
@@ -775,7 +899,8 @@ else:
             images = images.to(device)
             features = features.to(device)
             labels = labels.to(device)
-            outputs = model(images,features)
+            outputs = model(images)
+            #outputs = model(images,features)
             #print('---->{}'.format(outputs.data[0]))
             _, predicted = torch.max(outputs.data, 1)
             #print(predicted)
